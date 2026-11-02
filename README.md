@@ -155,3 +155,34 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+1. **Paying a share is one conditional `UPDATE`, not a transaction.**
+   `UPDATE shares SET paid_at = ?, idempotency_key = ? WHERE id = ? AND bill_id = ? AND paid_at IS NULL RETURNING ...`
+   is a compare-and-set. SQLite serialises writes, so when two requests race, exactly one gets a row
+   back and wins. The loser re-reads the share: same key means a retry and gets the same `200`,
+   a different key gets `409`. No locks or multi-statement transactions are needed, and the
+   `ck_shares_paid_state` constraint guarantees a share can never be paid without a key.
+
+2. **Member order is an explicit `position` column, written atomically.**
+   The order members were added decides who gets the extra cents, so it has to be exact.
+   `INSERT ... SELECT COALESCE(MAX(position), 0) + 1 ...` computes the next position inside the
+   insert itself, so two members added at the same time cannot collide. `UNIQUE (home_id, position)`
+   turns any collision into a hard error instead of silent corruption. Relying on timestamps or
+   rowid would have been fragile.
+
+3. **No validation or data-fetching libraries.**
+   Input is checked with small type guards on `unknown` (`requireName`, `requirePositiveCents`),
+   and the page uses a 40-line `useLoad` hook with a `loading | error | ready` union instead of a
+   query library. Fewer dependencies means every line is explainable, which this assignment
+   tests directly. Bill creation uses `DB.batch()` so the bill and all its shares are written in
+   one transaction.
+
+**Trade-off:** the idempotency key is stored on the `shares` row rather than in a separate
+idempotency table. That is enough here because the key is scoped to one share, and it lets the
+database enforce the paid/unpaid invariant with one `CHECK`. A general idempotency table would be
+the next step if keys had to be unique across all endpoints.
+
+**AI tools:** Claude Code was used to draft code and explanations; every file was reviewed,
+run, and tested by me.
